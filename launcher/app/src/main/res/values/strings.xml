@@ -145,4 +145,11 @@
     <!-- Cinematic top shelf (cinematic_home): the line under the focused dock app's name; %1$s is when it was
          last opened, e.g. "5 minutes ago" or "yesterday, 9:40 pm". -->
     <string name="last_opened">Last opened %1$s</string>
+    <string name="close_all">Close all</string>
+    <string name="no_background_apps">No recently used apps</string>
+    <string name="usage_access_needed">Allow Usage Access to show recently used apps</string>
+    <string name="app_close_restricted">Android does not allow this launcher to close other apps on this version.</string>
+    <string name="ram_storage_title">RAM and storage</string>
+    <string name="ram_storage_button">RAM %1$d%% · Storage %2$d%%</string>
+    <string name="ram_storage_description">RAM usage %1$d percent; internal storage usage %2$d percent. Open app management.</string>
 </resources>

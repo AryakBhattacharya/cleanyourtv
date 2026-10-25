@@ -3,6 +3,11 @@ package com.gathin.tvhome;
 import android.animation.ArgbEvaluator;
 import android.animation.ValueAnimator;
 import android.app.Activity;
+import android.app.ActivityManager;
+import android.app.AppOpsManager;
+import android.app.AlertDialog;
+import android.app.usage.UsageStats;
+import android.app.usage.UsageStatsManager;
 import android.app.Dialog;
 import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
@@ -45,7 +50,9 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.Process;
 import android.os.SystemClock;
+import android.os.StatFs;
 import android.provider.Settings;
 import android.text.SpannableString;
 import android.text.Spanned;
@@ -67,6 +74,7 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.RelativeLayout;
 import android.widget.PopupWindow;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -171,6 +179,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private TextView greeting;
     private View clockBlock;
     private View btnInputs;
+    private TextView btnRamStorage;
     /** config show_inputs_pill: false keeps the Inputs pill hidden even when the TV has inputs. */
     private boolean showInputsPill = true;
     private TextView btnWifi;
@@ -386,6 +395,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         coocaaSources = cfg.coocaaSources;
 
         root = findViewById(R.id.root);
+        clearRetiredReleaseData();
         root.setBackgroundColor(cfg.backgroundColor);
         // root fills the window with an opaque colour (Config keeps background_color opaque), so the window's own
         // black under it is a second full-screen fill on every frame for nothing. The starting window still uses
@@ -590,8 +600,10 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         }
 
         btnInputs = findViewById(R.id.btnInputs);
+        btnRamStorage = findViewById(R.id.btnRamStorage);
         View btnSettings = findViewById(R.id.btnSettings);
         btnInputs.setOnClickListener(v -> showInputs());
+        btnRamStorage.setOnClickListener(v -> showRamStoragePanel());
         btnWifi.setOnClickListener(v -> openNetworkPill());
         btnWifi.setOnLongClickListener(v -> {
             open(systemIntent(Settings.ACTION_WIFI_SETTINGS));
@@ -609,7 +621,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         });
         btnReorder = findViewById(R.id.btnReorder);
         btnReorder.setOnClickListener(v -> toggleReorder());
-        btnReorder.setVisibility(cfg.reorderButton ? View.VISIBLE : View.GONE);
+        // The top-bar control is removed; the dock stays rearrangeable from Launcher Settings and tile menus.
+        btnReorder.setVisibility(View.GONE);
         if (!cfg.showNetworkPill) btnWifi.setVisibility(View.GONE);
         showInputsPill = cfg.showInputsPill;
         showInputsMenuRow = cfg.showInputsPill;
@@ -621,7 +634,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         btnLibraryTop.setVisibility(cfg.libraryButton && cfg.appLibrary ? View.VISIBLE : View.GONE);
         iconOnlyButtons = cfg.iconOnlyButtons;
         topMenu = cfg.topMenu;
-        wifiIconOnly = iconOnlyButtons && cfg.wifiLabelWidth <= 0;
+        wifiIconOnly = true;
         if (cfg.wifiStatusColor) {
             wifiPlainTint = btnWifi.getCompoundDrawableTintList();
             wifiOnlineTint = getColorStateList(R.color.pill_icon_online);
@@ -644,12 +657,10 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             topButtons.setLayoutParams(tlp);
             topButtons.setGravity(Gravity.CENTER_VERTICAL);
         }
-        if (iconOnlyButtons) {
-            if (cfg.wifiLabelWidth > 0) btnWifi.setMaxWidth(Math.round(cfg.wifiLabelWidth * density));
-            else makeIconOnly(btnWifi);
-            makeIconOnly((TextView) btnSettings);
-        }
-        if (cfg.iconOnlyInputs) makeIconOnly((TextView) btnInputs);
+        makeIconOnly((TextView) btnInputs);
+        makeIconOnly(btnWifi);
+        makeIconOnly((TextView) btnSettings);
+        updateRamStorageLabel();
         btnSettings.setOnLongClickListener(v -> {
             showSettingsMenu();
             return true;
@@ -662,7 +673,6 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
             if (keyCode == KeyEvent.KEYCODE_DPAD_UP) return true;
             if (keyCode == KeyEvent.KEYCODE_DPAD_DOWN) {
-                // Back to the dock tile Up came from, not wherever the focus finder lands.
                 focusTile(lastFocused % COLUMNS);
                 return true;
             }
@@ -674,11 +684,12 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         };
         btnInputs.setOnKeyListener(pillKeys);
         btnWifi.setOnKeyListener(pillKeys);
+        btnRamStorage.setOnKeyListener(pillKeys);
         btnSettings.setOnKeyListener(pillKeys);
         btnReorder.setOnKeyListener(pillKeys);
         btnLibraryTop.setOnKeyListener(pillKeys);
         if (advancedEffects) {
-            for (View button : new View[]{btnInputs, btnWifi, btnReorder, btnLibraryTop, btnSettings}) {
+            for (View button : new View[]{btnInputs, btnWifi, btnRamStorage, btnReorder, btnLibraryTop, btnSettings}) {
                 button.setOnFocusChangeListener((view, focused) -> view.animate()
                         .scaleX(focused ? 1.04f : 1f).scaleY(focused ? 1.04f : 1f)
                         .setDuration(reducedMotion ? Motion.REDUCED_MS : 160).start());
@@ -824,6 +835,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             return;
         }
         restartIdleClock();
+        updateRamStorageLabel();
         promptsPaused = false;
         if (grid.getAdapter() == null) grid.setAdapter(adapter);   // dropped by onTrimMemory
         switch (tileRefresh.onResume(packagesChangedSinceRebuild())) {
@@ -1094,6 +1106,17 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             cm.unregisterNetworkCallback(networkCallback);
             cm.unregisterNetworkCallback(vpnCallback);
         }
+    }
+
+    /** Remove the retired releases feature's private credentials and cached artwork, preserving launcher settings. */
+    private void clearRetiredReleaseData() {
+        getSharedPreferences("live_releases", MODE_PRIVATE).edit().clear().apply();
+        File posters = new File(getCacheDir(), "release-posters");
+        File[] cachedPosters = posters.listFiles();
+        if (cachedPosters != null) {
+            for (File poster : cachedPosters) poster.delete();
+        }
+        posters.delete();
     }
 
     /**
@@ -2107,7 +2130,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
                     rtlAppGrid, keyCode == KeyEvent.KEYCODE_DPAD_LEFT);
         }
         if (keyCode == KeyEvent.KEYCODE_DPAD_UP) {
-            if (position < COLUMNS) return false;          // dock row: let focus move to the top bar
+            if (position < COLUMNS) {
+                return false;          // dock row: let focus move to the top bar
+            }
             target = position - COLUMNS;
         } else {
             int lastRowStart = ((count - 1) / COLUMNS) * COLUMNS;
@@ -2130,11 +2155,301 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         hideHero();
     }
 
-    /** The first top-bar button after Inputs that is shown: the network pill, Reorder, then Settings (always there). */
+    /** The first top-bar button after Inputs that is shown: network, RAM/storage, then Settings. */
     private View firstTopButton() {
         if (btnWifi.getVisibility() == View.VISIBLE) return btnWifi;
-        if (btnReorder.getVisibility() == View.VISIBLE) return btnReorder;
+        if (btnRamStorage.getVisibility() == View.VISIBLE) return btnRamStorage;
         return findViewById(R.id.btnSettings);
+    }
+
+    private void updateRamStorageLabel() {
+        if (btnRamStorage == null) return;
+        ActivityManager.MemoryInfo memory = new ActivityManager.MemoryInfo();
+        ActivityManager manager = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+        if (manager == null) return;
+        manager.getMemoryInfo(memory);
+        int ram = memory.totalMem <= 0 ? 0
+                : Math.round(100f * (memory.totalMem - memory.availMem) / memory.totalMem);
+        StatFs data = new StatFs(Environment.getDataDirectory().getPath());
+        long total = data.getTotalBytes();
+        long available = data.getAvailableBytes();
+        int storage = total <= 0 ? 0 : (int) Math.round(100d * (total - available) / total);
+        String label = getString(R.string.ram_storage_button, ram, storage);
+        btnRamStorage.setText(label);
+        btnRamStorage.setContentDescription(getString(R.string.ram_storage_description, ram, storage));
+    }
+
+    private void showRamStoragePanel() {
+        if (btnRamStorage == null) return;
+        if (openPopup != null) openPopup.dismiss();
+
+        int panelWidth = Math.min(Math.round(410 * density), getResources().getDisplayMetrics().widthPixels - Math.round(112 * density));
+        int pad = Math.round(10 * density);
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(pad, pad, pad, pad);
+        android.graphics.drawable.GradientDrawable panelBg = new android.graphics.drawable.GradientDrawable(
+                android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{0xFF10213E, 0xFF071326});
+        panelBg.setCornerRadius(22 * density);
+        panelBg.setStroke(Math.max(1, Math.round(density)), 0xFF385777);
+        panel.setBackground(panelBg);
+
+        LinearLayout closeAll = new LinearLayout(this);
+        closeAll.setGravity(Gravity.CENTER_VERTICAL);
+        closeAll.setPadding(Math.round(12 * density), 0, Math.round(12 * density), 0);
+        closeAll.setMinimumHeight(Math.round(58 * density));
+        closeAll.setFocusable(true);
+        closeAll.setClickable(true);
+        TextView closeAllIcon = new TextView(this);
+        closeAllIcon.setText("×");
+        closeAllIcon.setTextSize(27);
+        closeAllIcon.setTextColor(0xFFEAF6FF);
+        closeAll.addView(closeAllIcon, new LinearLayout.LayoutParams(Math.round(34 * density), ViewGroup.LayoutParams.WRAP_CONTENT));
+        TextView closeAllLabel = new TextView(this);
+        closeAllLabel.setText(R.string.close_all);
+        closeAllLabel.setTextSize(19);
+        closeAllLabel.setTextColor(0xFFEAF6FF);
+        closeAllLabel.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
+        closeAll.addView(closeAllLabel, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        panel.addView(closeAll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        View divider = new View(this);
+        divider.setBackgroundColor(0x557A9AB8);
+        LinearLayout.LayoutParams dividerLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, Math.round(density)));
+        dividerLp.setMargins(Math.round(8 * density), Math.round(5 * density), Math.round(8 * density), Math.round(8 * density));
+        panel.addView(divider, dividerLp);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(false);
+        scroll.setVerticalScrollBarEnabled(false);
+        LinearLayout appRows = new LinearLayout(this);
+        appRows.setOrientation(LinearLayout.VERTICAL);
+        scroll.addView(appRows, new ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        panel.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        final PopupWindow popup = glassPopup(panel, panelWidth);
+        Runnable refreshRows = () -> {
+            appRows.removeAllViews();
+            if (!hasUsageAccess()) {
+                TextView enable = new TextView(this);
+                enable.setText(R.string.usage_access_needed);
+                enable.setTextColor(0xFFB6C5D5);
+                enable.setTextSize(16);
+                enable.setGravity(Gravity.CENTER_VERTICAL);
+                enable.setPadding(Math.round(14 * density), 0, Math.round(14 * density), 0);
+                enable.setFocusable(true);
+                enable.setOnClickListener(v -> open(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)));
+                appRows.addView(enable, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Math.round(58 * density)));
+                ViewGroup.LayoutParams scrollLp = scroll.getLayoutParams();
+                scrollLp.height = Math.round(64 * density);
+                scroll.setLayoutParams(scrollLp);
+                return;
+            }
+            List<RunningApp> apps = getRecentApps();
+            if (apps.isEmpty()) {
+                TextView empty = new TextView(this);
+                empty.setText(R.string.no_background_apps);
+                empty.setTextColor(0xFFB6C5D5);
+                empty.setTextSize(16);
+                empty.setGravity(Gravity.CENTER_VERTICAL);
+                empty.setPadding(Math.round(14 * density), 0, Math.round(14 * density), 0);
+                appRows.addView(empty, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Math.round(58 * density)));
+            } else {
+                for (RunningApp app : apps) addRunningAppRow(appRows, app);
+            }
+            int visibleRows = Math.max(1, Math.min(appRows.getChildCount(), 4));
+            ViewGroup.LayoutParams scrollLp = scroll.getLayoutParams();
+            scrollLp.height = Math.round(visibleRows * 64 * density);
+            scroll.setLayoutParams(scrollLp);
+        };
+        Runnable closeAllAction = () -> {
+            if (!hasUsageAccess()) {
+                open(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS));
+                return;
+            }
+            if (Build.VERSION.SDK_INT >= 34) {
+                Toast.makeText(this, R.string.app_close_restricted, Toast.LENGTH_LONG).show();
+                return;
+            }
+            ActivityManager manager = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            if (manager == null) return;
+            for (RunningApp app : getRecentApps()) {
+                manager.killBackgroundProcesses(app.packageName);
+                markAppClosed(app);
+            }
+            updateRamStorageLabel();
+            panel.postDelayed(refreshRows, 500);
+        };
+        closeAll.setOnClickListener(v -> closeAllAction.run());
+        closeAll.setOnFocusChangeListener((v, focused) -> {
+            v.setBackground(focused ? ramFocusBackground() : null);
+            closeAllIcon.setTextColor(focused ? 0xFF10213E : 0xFFEAF6FF);
+            closeAllLabel.setTextColor(focused ? 0xFF10213E : 0xFFEAF6FF);
+        });
+        refreshRows.run();
+        dropIn(popup, panel, btnRamStorage, Gravity.END);
+        if (appRows.getChildCount() > 0) appRows.getChildAt(0).requestFocus();
+    }
+
+    private void addRunningAppRow(LinearLayout rows, RunningApp app) {
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(Math.round(12 * density), 0, Math.round(10 * density), 0);
+        row.setMinimumHeight(Math.round(58 * density));
+        row.setFocusable(true);
+        row.setClickable(true);
+        ImageView icon = new ImageView(this);
+        try {
+            icon.setImageDrawable(getPackageManager().getApplicationIcon(app.packageName));
+        } catch (PackageManager.NameNotFoundException ignored) {
+            icon.setImageResource(R.mipmap.ic_launcher);
+        }
+        LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(Math.round(34 * density), Math.round(34 * density));
+        row.addView(icon, iconLp);
+
+        TextView label = new TextView(this);
+        label.setText(app.label);
+        label.setTextSize(18);
+        label.setSingleLine(true);
+        label.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        label.setTextColor(0xFFEAF4FF);
+        label.setPadding(Math.round(14 * density), 0, Math.round(8 * density), 0);
+        row.addView(label, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+
+        TextView close = new TextView(this);
+        close.setText("×");
+        close.setTextSize(28);
+        close.setGravity(Gravity.CENTER);
+        close.setTextColor(0xFFEAF4FF);
+        row.addView(close, new LinearLayout.LayoutParams(Math.round(38 * density), Math.round(48 * density)));
+
+        row.setOnFocusChangeListener((v, focused) -> {
+            v.setBackground(focused ? ramFocusBackground() : null);
+            int color = focused ? 0xFF10213E : 0xFFEAF4FF;
+            label.setTextColor(color);
+            close.setTextColor(color);
+        });
+        row.setOnClickListener(v -> {
+            if (!hasUsageAccess()) {
+                open(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS));
+                return;
+            }
+            if (Build.VERSION.SDK_INT >= 34) {
+                Toast.makeText(this, R.string.app_close_restricted, Toast.LENGTH_LONG).show();
+                return;
+            }
+            ActivityManager manager = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            if (manager != null) manager.killBackgroundProcesses(app.packageName);
+            markAppClosed(app);
+            updateRamStorageLabel();
+            rows.postDelayed(() -> {
+                rows.removeAllViews();
+                for (RunningApp remaining : getRecentApps()) addRunningAppRow(rows, remaining);
+                if (rows.getChildCount() == 0) {
+                    TextView empty = new TextView(this);
+                    empty.setText(R.string.no_background_apps);
+                    empty.setTextColor(0xFFB6C5D5);
+                    empty.setTextSize(16);
+                    empty.setGravity(Gravity.CENTER_VERTICAL);
+                    empty.setPadding(Math.round(14 * density), 0, Math.round(14 * density), 0);
+                    rows.addView(empty, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Math.round(58 * density)));
+                }
+                int visibleRows = Math.max(1, Math.min(rows.getChildCount(), 4));
+                ViewGroup scrollView = (ViewGroup) rows.getParent();
+                ViewGroup.LayoutParams lp = scrollView.getLayoutParams();
+                lp.height = Math.round(visibleRows * 64 * density);
+                scrollView.setLayoutParams(lp);
+                if (rows.getChildCount() > 0) rows.getChildAt(0).requestFocus();
+            }, 500);
+        });
+        LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Math.round(58 * density));
+        rowLp.setMargins(Math.round(1 * density), Math.round(2 * density), Math.round(1 * density), Math.round(2 * density));
+        rows.addView(row, rowLp);
+    }
+
+    private android.graphics.drawable.Drawable ramFocusBackground() {
+        android.graphics.drawable.GradientDrawable focused = new android.graphics.drawable.GradientDrawable();
+        focused.setColor(0xFFC9EEFF);
+        focused.setCornerRadius(18 * density);
+        return focused;
+    }
+
+    private boolean hasUsageAccess() {
+        AppOpsManager appOps = (AppOpsManager) getSystemService(APP_OPS_SERVICE);
+        return appOps != null && appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS,
+                Process.myUid(), getPackageName()) == AppOpsManager.MODE_ALLOWED;
+    }
+
+    private List<RunningApp> getRecentApps() {
+        UsageStatsManager statsManager = (UsageStatsManager) getSystemService(USAGE_STATS_SERVICE);
+        if (statsManager == null || !hasUsageAccess()) return Collections.emptyList();
+        long now = System.currentTimeMillis();
+        long start = now - 24L * 60L * 60L * 1000L;
+        List<UsageStats> usage = statsManager.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, start, now);
+        if (usage == null || usage.isEmpty()) return Collections.emptyList();
+        SharedPreferences closed = getSharedPreferences("ram_manager_closed_apps", MODE_PRIVATE);
+        Map<String, RunningApp> apps = new HashMap<>();
+        for (UsageStats stat : usage) {
+            String packageName = stat.getPackageName();
+            long lastUsed = stat.getLastTimeUsed();
+            if (packageName == null || packageName.equals(getPackageName()) || isProtectedApp(packageName)
+                    || lastUsed < start || lastUsed <= closed.getLong(packageName, 0)) continue;
+            try {
+                ApplicationInfo info = getPackageManager().getApplicationInfo(packageName, 0);
+                if ((info.flags & ApplicationInfo.FLAG_PERSISTENT) != 0
+                        || getPackageManager().getLaunchIntentForPackage(packageName) == null) continue;
+                String label = String.valueOf(getPackageManager().getApplicationLabel(info));
+                String normalizedLabel = label.toLowerCase(Locale.ROOT);
+                if (normalizedLabel.contains("webview") || normalizedLabel.equals("tv manager")) continue;
+                RunningApp current = apps.get(packageName);
+                if (current == null || lastUsed > current.lastUsed) {
+                    apps.put(packageName, new RunningApp(packageName, label, lastUsed));
+                }
+            } catch (PackageManager.NameNotFoundException ignored) {
+                // The package may have been removed since its usage event was recorded.
+            }
+        }
+        List<RunningApp> result = new ArrayList<>(apps.values());
+        Collections.sort(result, (a, b) -> Long.compare(b.lastUsed, a.lastUsed));
+        return result;
+    }
+
+    private void markAppClosed(RunningApp app) {
+        getSharedPreferences("ram_manager_closed_apps", MODE_PRIVATE).edit()
+                .putLong(app.packageName, System.currentTimeMillis()).apply();
+    }
+
+    private boolean isProtectedApp(String packageName) {
+        return packageName.equals("android")
+                || packageName.equals("com.android.systemui")
+                || packageName.equals("com.android.phone")
+                || packageName.equals("com.android.settings")
+                || packageName.equals("com.android.tv.settings")
+                || packageName.equals("com.android.tv")
+                || packageName.equals("com.android.providers.tv")
+                || packageName.equals("com.android.packageinstaller")
+                || packageName.equals("com.droidlogic.droidlivetv")
+                || packageName.equals("com.droidlogic.tvinput")
+                || packageName.equals("com.google.android.tvlauncher")
+                || packageName.equals("com.mitv.tvhome.atv")
+                || packageName.equals("com.mitv.tvhome.mitvplus")
+                || packageName.startsWith("com.android.providers.")
+                || packageName.startsWith("com.android.webview")
+                || packageName.toLowerCase(Locale.ROOT).contains("tvmanager")
+                || packageName.equals("com.google.android.gms")
+                || packageName.equals("com.google.android.gsf");
+    }
+
+    private static final class RunningApp {
+        final String packageName;
+        final String label;
+        final long lastUsed;
+        RunningApp(String packageName, String label, long lastUsed) {
+            this.packageName = packageName;
+            this.label = label;
+            this.lastUsed = lastUsed;
+        }
     }
 
     @Override public void onLibraryUp() {
@@ -2472,7 +2787,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
 
     /** Turns a labelled top pill into the round TopButtonIcon shape: no text, the icon centred by even padding. */
     private void makeIconOnly(TextView pill) {
-        pill.setContentDescription(pill.getText());
+        if (!TextUtils.isEmpty(pill.getText())) pill.setContentDescription(pill.getText());
         pill.setText(null);
         pill.setMaxWidth(Integer.MAX_VALUE);
         int pad = Math.round(10 * density);
